@@ -1,0 +1,193 @@
+# Databricks notebook source
+spark.sql("""
+CREATE DATABASE IF NOT EXISTS retail
+LOCATION '/mnt/datalake/retail'
+""")
+
+# COMMAND ----------
+
+from pyspark.sql.functions import *
+from pyspark.sql.types import StructField, LongType, DoubleType, IntegerType, DateType
+
+# Define input and checkpoint paths
+inputpath = "dbfs:/FileStore/shared_uploads/praneethlingoju@gmail.com/sales_data.json"
+checkpoint_path = "/tmp/checkpoints/bronze_sales"
+
+#defining schema for raw_sales_df
+raw_sales_schema = StructType([
+    StructField("product_id",StringType(),True),
+    StructField("quantity",LongType(),True),
+    StructField("store_id",StringType(),True),
+    StructField("timestamp",StringType(),True),
+    StructField("unit_price",DoubleType(),True)
+    ])
+
+# Read JSON using Auto Loader
+raw_sales_df = (
+            spark.read
+                .format("json")
+                .option("schema",raw_sales_schema)
+                .load(inputpath)
+)
+
+# Write to Bronze Delta table
+(
+raw_sales_df.write
+        .format("delta")
+        .mode("overwrite")
+        .option("checkpointLocation", checkpoint_path)
+        .saveAsTable("retail.bronze_sales")
+)
+
+
+
+# COMMAND ----------
+
+# Read Bronze Table
+bronze_df = spark.read.table("retail.bronze_sales")
+
+#defining schema for raw_sales_df
+product_schema = StructType([
+    StructField("product_id", StringType(), True),
+    StructField("product_name", StringType(), True),
+    StructField("category", StringType(), True)
+])
+
+# Read Product Metadata
+product_df = (
+    spark.read
+    .format("csv")
+    .option("schema",product_schema)
+    .option("header",True)
+    .load("dbfs:/FileStore/shared_uploads/praneethlingoju@gmail.com/product_metadata.csv")
+)
+
+# COMMAND ----------
+
+# renaming product_id to prd_id
+product_df = product_df.withColumnRenamed("product_id","prd_id")
+
+# Enrich and clean
+silver_df = (
+    bronze_df
+        .join(
+            product_df,
+            bronze_df["product_id"] == product_df["prd_id"],"left"
+            )
+            .withColumn("total_amount",col("quantity")*col("unit_price"))
+            .withColumn("timestamp",to_timestamp("timestamp"))
+)
+
+# Write to Silver Table
+(
+silver_df
+        .write
+        .mode("overwrite")
+        .option("checkpointLocation", checkpoint_path)
+        .saveAsTable("retail.silver_sales")
+)
+
+# COMMAND ----------
+
+
+silver_df = spark.read.table("retail.silver_sales")
+
+# Aggregate
+gold_df = silver_df.groupBy(
+    "store_id",
+    date_trunc("DAY", "timestamp").alias("sales_date")
+).agg(
+    sum("total_amount").alias("daily_sales"),
+    count("*").alias("transaction_count")
+)
+
+# Write to Gold Table
+(
+gold_df
+    .write
+    .format("delta")
+    .mode("overwrite")
+    .saveAsTable("retail.gold_daily_sales")
+)
+
+
+# COMMAND ----------
+
+
+# Define input and checkpoint paths
+discount_ip = "dbfs:/FileStore/shared_uploads/praneethlingoju@gmail.com/product_discounts.csv"
+checkpoint_path = "/tmp/checkpoints/bronze_sales"
+
+# Defining Schema for discount dataframe
+discount_schema = StructType([
+                    StructField("product_id",StringType(),True),
+                    StructField("store_id",StringType(),True),
+                    StructField("discount_percent",IntegerType(),True),
+                    StructField("start_date",DateType(),True),
+                    StructField("end_date",DateType(),True)
+])
+
+# Reading Data to a DF
+discount_df = (
+    spark.read
+        .format("csv")
+        .option("header",True)
+        .option("schema",discount_schema)
+        .load(discount_ip)
+)
+
+# Write to Bronze Delta table
+(
+discount_df.write
+        .format("csv")
+        .mode("overwrite")
+        .option("checkpointLocation", checkpoint_path)
+        .saveAsTable("retail.discount")
+)
+
+
+# COMMAND ----------
+
+# read sales data
+silver_sales_df = spark.sql("select * from retail.silver_sales")
+
+# read discount data
+discount = spark.read.table("retail.discount")
+
+# Join the Silver sales data with the discounts (on product_id + store_id)
+sales_discount_join_df = (
+    silver_sales_df.join(broadcast(discount),(silver_sales_df["product_id"]==discount["product_id"]) & 
+        (silver_sales_df["store_id"]==discount["store_id"]),"left")
+    .select(
+        silver_sales_df["product_id"], 
+        silver_sales_df["quantity"], 
+        silver_sales_df["store_id"], 
+        silver_sales_df["timestamp"], 
+        silver_sales_df["transaction_id"], 
+        silver_sales_df["unit_price"], 
+        silver_sales_df["product_name"], 
+        silver_sales_df["category"], 
+        silver_sales_df["total_amount"], 
+        discount["discount_percent"], 
+        discount["start_date"], 
+        discount["end_date"]
+        )
+)
+
+sales_discount_join_df = sales_discount_join_df.withColumn("sale_date", to_date("timestamp"))
+
+# Apply discount only if timestamp falls within start_date and end_date
+effective_discount_df = sales_discount_join_df.withColumn(
+    "effective_discount",
+    when(
+        (col("sale_date") >= col("start_date")) & (col("sale_date") <= col("end_date")),
+        col("discount_percent")
+    ).otherwise(lit(0))
+)
+
+# Calculate discounted total
+
+discounted_total_df = effective_discount_df.withColumn(
+    "discounted_total",
+    col("quantity") * col("unit_price") * (1 - (col("effective_discount")/100))
+)
